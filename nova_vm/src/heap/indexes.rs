@@ -135,7 +135,7 @@ pub type SymbolIndex = BaseIndex<SymbolHeapData>;
 pub type ElementIndex = BaseIndex<[Option<Value>]>;
 
 impl ObjectIndex {
-    pub fn get<'a>(self, heap: &'a Heap) -> &'a ObjectHeapData {
+    pub fn get(self, heap: &Heap) -> &ObjectHeapData {
         heap.objects
             .get(self.into_index())
             .unwrap()
