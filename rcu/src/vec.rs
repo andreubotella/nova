@@ -1,57 +1,17 @@
-use std::{alloc::Layout, cell::UnsafeCell, mem, ptr::{write, NonNull}, sync::{atomic::{AtomicPtr, AtomicU32, Ordering}, Arc}};
+use std::{
+    alloc::Layout,
+    mem,
+    ops::Deref,
+    ptr::{write, NonNull},
+    sync::{
+        atomic::{AtomicPtr, AtomicU32, Ordering},
+        Arc,
+    },
+};
 
-/// Provides exclusive access to the contained value
-/// 
-/// The purpose of this type is to split into mutator
-/// and reader cells.
-#[derive(Debug)]
-pub struct ExclusiveCell<T: Sync>(Box<T>);
+use crate::spmc::cell::MutatorKey;
 
-impl<T> ExclusiveCell<T> where T: Sized + Sync {
-    pub fn new(t: T) -> Self {
-        Self(Box::new(t))
-    }
-
-    pub fn get_mut(&mut self) -> &mut T {
-        self.0.as_mut()
-    }
-
-    pub fn split_to_threads(self) -> MutatorCell<T> {
-        MutatorCell::new(self.0)
-    }
-}
-
-#[derive(Debug)]
-pub struct MutatorCell<T: Sized + Sync>(*mut T, Arc<*mut T>);
-
-impl<T: Sized + Sync> MutatorCell<T> {
-    fn new(t: Box<T>)  -> Self {
-        let t_pointer = Box::<T>::leak(t) as *mut T;
-        MutatorCell(t_pointer, Arc::new(t_pointer))
-    }
-
-    pub fn get_reader(&mut self) -> ReaderCell<T> {
-        ReaderCell::new(self.1.clone())
-    }
-}
-
-// SAFETY: It is safe to change the mutator thread.
-unsafe impl<T: Sized + Sync> Send for MutatorCell<T> {}
-
-#[derive(Debug, Clone)]
-pub struct ReaderCell<T: Sized + Sync>(Arc<*mut T>);
-
-impl<T: Sized + Sync> ReaderCell<T> {
-    fn new(arc: Arc<*mut T>) -> Self {
-        Self(arc)
-    }
-
-    fn get(&self) -> &T {
-        unsafe { &**self.0 }
-    }
-}
-
-pub struct RCUVec<T: Sized> {
+pub struct Vec<T: Sized> {
     ptr: AtomicPtr<T>,
     cap: AtomicU32,
     len: AtomicU32,
@@ -62,34 +22,62 @@ pub struct VecDropContainer<T: Sized> {
     cap: usize,
 }
 
-pub struct VecDropData<T: Sized>(Box<VecDropContainer<T>>, fn(Box<VecDropContainer<T>>));
+pub struct VecDropData<T: Sized>(Box<VecDropContainer<T>>, fn(&mut Box<VecDropContainer<T>>));
 
-fn drop_vec_drop_container<T: Sized>(container: Box<VecDropContainer<T>>) {
+impl<T> Drop for VecDropData<T> {
+    fn drop(&mut self) {
+        let Self (data, call) = self;
+        call(data);
+    }
+}
+
+fn drop_vec_drop_container<T: Sized>(container: &mut Box<VecDropContainer<T>>) {
     // We should never be deallocating empty allocations.
     debug_assert_ne!(container.cap, 0);
     // Layout::array checks that the number of bytes is <= usize::MAX,
-        // but this is redundant since old_layout.size() <= i32::MAX,
-        // so the `unwrap` should never fail.
+    // but this is redundant since old_layout.size() <= i32::MAX,
+    // so the `unwrap` should never fail.
     let layout = Layout::array::<T>(container.cap).unwrap();
     // SAFETY: The layout was allocated by the global allocator using
     // Layout::array<T>(cap).
     unsafe { std::alloc::dealloc(container.ptr.as_ptr() as *mut u8, layout) }
 }
 
-impl<T> RCUVec<T> {
-    fn new() -> Self {
-        assert!(mem::size_of::<T>() != 0, "RCUVec does not support ZSTs");
-        RCUVec {
+impl<T> Vec<T> {
+    pub fn new() -> Self {
+        assert!(mem::size_of::<T>() != 0, "Vec does not support ZSTs");
+        Vec {
             ptr: AtomicPtr::new(mem::align_of::<T>() as *mut T),
             cap: 0.into(),
             len: 0.into(),
         }
     }
 
+    pub fn with_capacity(capacity: u32) -> Self {
+        if capacity.is_power_of_two() {
+            let layout = Layout::array::<T>(capacity as usize).unwrap();
+            // SAFETY: Layout guarantees that we're properly aligned for T and
+            // we've made sure that new_cap is non-zero.
+            let ptr = unsafe { std::alloc::alloc(layout) } as *mut T;
+            assert!(!ptr.is_null());
+            Vec {
+                ptr: AtomicPtr::new(ptr),
+                cap: AtomicU32::new(capacity),
+                len: AtomicU32::new(0),
+            }
+        } else {
+            panic!("Stop");
+        }
+    }
+
     /// Grow the vector through an exclusive reference
     fn grow_mut(&mut self) {
         // This can't overflow because we ensure self.cap <= i32::MAX.
-        let new_cap = if *self.cap.get_mut() == 0 { 1 } else { 2 * *self.cap.get_mut() };
+        let new_cap = if *self.cap.get_mut() == 0 {
+            1
+        } else {
+            2 * *self.cap.get_mut()
+        };
 
         // Layout::array checks that the number of bytes is <= usize::MAX,
         // but this is redundant since old_layout.size() <= i32::MAX,
@@ -97,7 +85,10 @@ impl<T> RCUVec<T> {
         let new_layout = Layout::array::<T>(new_cap as usize).unwrap();
 
         // Ensure that the new allocation doesn't exceed `i32::MAX` bytes.
-        assert!(new_layout.size() <= i32::MAX as usize, "Allocation too large");
+        assert!(
+            new_layout.size() <= i32::MAX as usize,
+            "Allocation too large"
+        );
 
         let new_ptr = if *self.cap.get_mut() == 0 {
             // SAFETY: Layout guarantees that we're properly aligned for T and
@@ -123,13 +114,14 @@ impl<T> RCUVec<T> {
         }
     }
 
-    /// Grow the RCUVec through a shared reference
+    /// Grow the Vec through a shared reference
     ///
     /// The function returns a drop-container containing a pointer to the data
     /// of the old allocation and drop function to call with the data when drop
     /// is desired. The caller should ensure that no readers to the old pointer
     /// exist when the drop function is called.
-    fn grow(&self) -> Option<VecDropData<T>> {
+    #[must_use]
+    fn grow(&self, _: &MutatorKey<'_>) -> Option<VecDropData<T>> {
         // Note: We can load the data in a relaxed fashion because only one
         // thread should ever be mutating the vector. Since we're growing it,
         // that thread must be us.
@@ -159,7 +151,10 @@ impl<T> RCUVec<T> {
         let new_layout = Layout::array::<T>(new_cap as usize).unwrap();
 
         // Ensure that the new allocation doesn't exceed `i32::MAX` bytes.
-        assert!(new_layout.size() <= i32::MAX as usize, "Allocation too large");
+        assert!(
+            new_layout.size() <= i32::MAX as usize,
+            "Allocation too large"
+        );
 
         // SAFETY: Layout guarantees that we're properly aligned for T and
         // we've made sure that new_cap is non-zero.
@@ -186,15 +181,19 @@ impl<T> RCUVec<T> {
         // thread allowed to use the new capacity, and that's us, we don't need
         // to release this.
         self.cap.store(new_cap, Ordering::Release);
-        let data: Box<VecDropContainer<T>> = Box::new(VecDropContainer { ptr: NonNull::new(old_ptr).unwrap(), cap: old_cap as usize });
+        let data: Box<VecDropContainer<T>> = Box::new(VecDropContainer {
+            ptr: NonNull::new(old_ptr).unwrap(),
+            cap: old_cap as usize,
+        });
         Some(VecDropData(data, drop_vec_drop_container))
     }
 
-    pub fn push(&self, elem: T) -> Option<VecDropData<T>> {
+    #[must_use]
+    pub fn push(&self, elem: T, key: &MutatorKey<'_>) -> Option<VecDropData<T>> {
         // SAFETY: Only mutator thread is allowed to mutate; relaxed loads are fine here.
         let len = self.len.load(Ordering::Relaxed);
         let result = if len == self.cap.load(Ordering::Relaxed) {
-            self.grow()
+            self.grow(key)
         } else {
             None
         };
@@ -225,5 +224,20 @@ impl<T> RCUVec<T> {
         }
 
         *self.len.get_mut() = len + 1;
+    }
+}
+
+impl<T> Deref for Vec<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        // SAFETY: We must acquire the length to see all changes made to the
+        // buffer.
+        let len = self.len.load(Ordering::Acquire);
+        // SAFETY: Reading pointer relaxed is okay: We don't care if this is
+        // some new, larger pointer or the old pointer associated with len.
+        // In both cases the pointer points to valid memory of at least len
+        // items.
+        let ptr = self.ptr.load(Ordering::Relaxed);
+        unsafe { std::slice::from_raw_parts(ptr, len as usize) }
     }
 }
